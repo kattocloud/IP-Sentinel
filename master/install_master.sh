@@ -18,15 +18,56 @@ fi
 SECURE_TMP=$(mktemp -d /tmp/ips_master_install.XXXXXX)
 trap 'rm -rf "$SECURE_TMP"' EXIT HUP INT QUIT TERM
 
+# ==========================================================
+# 🔍 核心探针: 系统环境与虚拟化检测 (v4.0.13 架构升级)
+# ==========================================================
+is_systemd() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    [ -d /run/systemd/system ] || return 1
+    return 0
+}
+
+get_os_info() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$PRETTY_NAME"
+    else
+        uname -srm
+    fi
+}
+
+get_virt_info() {
+    if grep -qaE 'docker|containerd|podman' /proc/1/cgroup 2>/dev/null || [ -f /.dockerenv ]; then
+        echo "Docker/OCI Container"
+    elif grep -qa container=lxc /proc/1/environ 2>/dev/null || [ -d /proc/vz ]; then
+        echo "LXC/OpenVZ"
+    elif command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt
+    else
+        echo "Unknown/Bare Metal"
+    fi
+}
+
+echo -e "\n======================================"
+echo -e "📊 \033[36mIP-Sentinel 中枢靶机环境侦测\033[0m"
+echo -e "--------------------------------------"
+echo -e "OS 架构   : $(get_os_info)"
+echo -e "虚拟化    : $(get_virt_info)"
+if is_systemd; then
+    echo -e "Init 系统 : systemd ✅"
+else
+    echo -e "Init 系统 : 非 systemd ⚠️ (将自动降维至看门狗模式)"
+fi
+echo -e "======================================\n"
+sleep 1
+
 # 你的 GitHub 仓库 Raw 数据直链前缀
 REPO_RAW_URL="https://raw.githubusercontent.com/hotyue/IP-Sentinel/main"
-# 临时改为开发地址用于测试
-# REPO_RAW_URL="https://raw.githubusercontent.com/hotyue/IP-Sentinel/v3.6.2-rc"
 
 # [核心: 动态提取 Master 专属版本锚点 (KV 解析法)]
 # 通过 grep 定位 MASTER_VERSION 行，再通过 cut 提取等号右侧的值
-# [修复] 增加 -L 与双栈容灾 (-4)，解决纯 V6 或 V6 优先机器连接 GitHub Raw 易超时的问题
-TARGET_VERSION=$( (curl -sL -m 5 "${REPO_RAW_URL}/version.txt" || curl -4 -sL -m 5 "${REPO_RAW_URL}/version.txt") 2>/dev/null | grep "^MASTER_VERSION=" | cut -d'=' -f2 | tr -d '[:space:]')
+# [红警修复] 增加 -f 与 --retry 护甲，防御 404 吞雷 Bug
+TARGET_VERSION=$( (curl -fsSL --connect-timeout 5 --retry 2 "${REPO_RAW_URL}/version.txt" || curl -4 -fsSL --connect-timeout 5 --retry 2 "${REPO_RAW_URL}/version.txt") 2>/dev/null | grep "^MASTER_VERSION=" | cut -d'=' -f2 | tr -d '[:space:]')
 
 # 🛡️ 兜底防线：如果网络波动拉取失败，启用内置的最新兜底版本
 TARGET_VERSION=${TARGET_VERSION:-"4.0.7"}
@@ -72,7 +113,7 @@ else
 
     if [ "$ACTION_CHOICE" == "2" ]; then
         echo -e "\n⏳ 正在拉取卸载程序..."
-        curl -sL "${REPO_RAW_URL}/master/uninstall_master.sh" -o "${SECURE_TMP}/uninstall_master.sh"
+        curl -fsSL --connect-timeout 10 --retry 3 "${REPO_RAW_URL}/master/uninstall_master.sh" -o "${SECURE_TMP}/uninstall_master.sh"
         chmod +x "${SECURE_TMP}/uninstall_master.sh"
         bash "${SECURE_TMP}/uninstall_master.sh"
         rm -f "/tmp/uninstall_master.sh"
@@ -147,15 +188,24 @@ if [ ${#MISSING_CMDS[@]} -gt 0 ]; then
         # [v3.6.3 抽脂级优化] 注入 --no-install-recommends 拒绝捆绑销售
         apt-get install -y --no-install-recommends curl jq sqlite3 cron procps openssl >/dev/null 2>&1
         systemctl enable cron >/dev/null 2>&1 && systemctl start cron >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
+    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v microdnf >/dev/null 2>&1; then
+        # RHEL / CentOS / AlmaLinux / Rocky 系列 (含极简 microdnf 镜像)
         PKG_MGR="yum"
         OPT_ARGS=""
         if command -v dnf >/dev/null 2>&1; then
             PKG_MGR="dnf"
             # [v3.6.3 抽脂级优化] 强行关闭 DNF 的弱依赖拉取
             OPT_ARGS="--setopt=install_weak_deps=False"
+        elif command -v microdnf >/dev/null 2>&1; then
+            PKG_MGR="microdnf"
         fi
-        $PKG_MGR install -y $OPT_ARGS curl jq sqlite cronie procps-ng openssl >/dev/null 2>&1
+        
+        echo -e "\033[90m   (正在安装 epel-release 扩展源，请稍候...)\033[0m"
+        $PKG_MGR install -y epel-release >/dev/null 2>&1 || true
+        
+        echo -e "\033[90m   (正在拉取核心组件...)\033[0m"
+        # [核心修复] 移除屏蔽符，暴露真实执行过程
+        $PKG_MGR install -y $OPT_ARGS curl jq sqlite cronie procps-ng openssl
         systemctl enable crond >/dev/null 2>&1 && systemctl start crond >/dev/null 2>&1
     elif command -v apk >/dev/null 2>&1; then
         echo "Alpine 探测到系统类型为 Alpine Linux，正在执行轻量级安装..."
@@ -288,7 +338,7 @@ chmod 600 "$DB_FILE"
 echo -e "\n[4/4] 正在拉取新版司令部核心引擎..."
 
 TMP_MASTER="${SECURE_TMP}/tg_master.sh"
-curl -sL "${REPO_RAW_URL}/master/tg_master.sh" -o "$TMP_MASTER"
+curl -fsSL --connect-timeout 10 --retry 3 "${REPO_RAW_URL}/master/tg_master.sh" -o "$TMP_MASTER"
 
 # 🛡️ 防砖终极校验
 if [ ! -s "$TMP_MASTER" ]; then
@@ -301,7 +351,7 @@ fi
 # 🟢 [原子化交接核心]: 校验完美通过，新代码已备妥！
 # 以雷霆手段抹杀旧版调度进程，杜绝文件覆写时的并发错乱
 echo "⏳ 新引擎校验通过，正在抹杀旧版守护进程..."
-if command -v systemctl >/dev/null 2>&1; then
+if is_systemd; then
     systemctl kill --signal=SIGKILL ip-sentinel-master.service >/dev/null 2>&1 || true
     systemctl stop ip-sentinel-master.service >/dev/null 2>&1 || true
 fi
@@ -311,7 +361,7 @@ pkill -9 -f "tg_master.sh" >/dev/null 2>&1 || true
 mv "$TMP_MASTER" "${MASTER_DIR}/tg_master.sh"
 chmod +x "${MASTER_DIR}/tg_master.sh"
 
-if command -v systemctl >/dev/null 2>&1; then
+if is_systemd; then
     echo "💡 检测到 Systemd 环境，正在部署原生守护服务..."
     
     cat > /etc/systemd/system/ip-sentinel-master.service << EOF
